@@ -174,19 +174,19 @@ class SignalProcessor:
 def _demo_loop() -> None:
     signal_processor = SignalProcessor()
     detector = LandmarkDetector()
-    last_metrics: Optional[FaceMetrics] = None
+    last_frame: Optional[np.ndarray] = None
 
     def on_frame(frame: np.ndarray) -> None:
-        nonlocal last_metrics
-        last_metrics = detector.process(frame)
+        nonlocal last_frame
+        last_frame = frame.copy()
 
     with CameraCapture() as camera:
         camera.frame_callback = on_frame
         try:
             while True:
                 now = time.monotonic()
-                if last_metrics is not None:
-                    metrics = last_metrics
+                if last_frame is not None:
+                    metrics = detector.process(last_frame)
                     scores = signal_processor.update(
                         timestamp=now,
                         face_present=metrics.face_present,

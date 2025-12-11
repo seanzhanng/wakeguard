@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
+import json
+import time
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import time
 
 from .camera import CameraCapture
 from .landmarks import LandmarkDetector, FaceMetrics
@@ -16,6 +17,7 @@ from .state_machine import (
     FocusStateMachine,
     StateParams,
 )
+from data.db import init_db, insert_session, insert_event
 
 
 @dataclass
@@ -134,6 +136,50 @@ class FocusSession:
             events=list(self.events),
         )
 
+    def save_to_db(self, notes: Optional[str] = None) -> int:
+        if self.start_time_wall is None or self.start_time_mono is None:
+            raise RuntimeError("Session has not been started")
+        if self.end_time_wall is None or self.end_time_mono is None:
+            raise RuntimeError("Session has not been ended")
+        stats = self.summary()
+        config_payload = {
+            "session_config": asdict(self.config),
+            "state_params": asdict(self.state_machine.params),
+            "signal_config": asdict(self.signal_processor.config),
+        }
+        config_json = json.dumps(config_payload)
+        init_db()
+        session_id = insert_session(
+            start_time=stats.start_time,
+            end_time=stats.end_time,
+            duration_seconds=stats.duration_seconds,
+            focused_seconds=stats.focused_seconds,
+            drowsy_seconds=stats.drowsy_seconds,
+            distracted_seconds=stats.distracted_seconds,
+            config_json=config_json,
+            notes=notes,
+        )
+        for event in self.events:
+            if self.start_time_mono is not None and self.start_time_wall is not None:
+                offset = max(0.0, event.timestamp - self.start_time_mono)
+                wall_timestamp = self.start_time_wall + timedelta(seconds=offset)
+            else:
+                wall_timestamp = stats.start_time
+            details = {
+                "from_state": event.from_state.name,
+                "to_state": event.to_state.name,
+                "drowsiness_score": event.drowsiness_score,
+                "distraction_score": event.distraction_score,
+            }
+            details_json = json.dumps(details)
+            insert_event(
+                session_id=session_id,
+                timestamp=wall_timestamp,
+                type=event.event_type.name,
+                details_json=details_json,
+            )
+        return session_id
+
     def _apply_detection_mask(self, scores: SignalScores) -> SignalScores:
         d_score = scores.drowsiness_score if self.config.detect_drowsiness else 0.0
         dis_score = scores.distraction_score if self.config.detect_distraction else 0.0
@@ -157,11 +203,11 @@ def _console_session_demo() -> None:
         SignalConfig(),
     )
     detector = LandmarkDetector()
-    last_metrics: Optional[FaceMetrics] = None
+    last_frame: Optional[np.ndarray] = None
 
     def on_frame(frame: np.ndarray) -> None:
-        nonlocal last_metrics
-        last_metrics = detector.process(frame)
+        nonlocal last_frame
+        last_frame = frame.copy()
 
     with CameraCapture() as camera:
         camera.frame_callback = on_frame
@@ -169,8 +215,9 @@ def _console_session_demo() -> None:
         try:
             while True:
                 now = time.monotonic()
-                if last_metrics is not None:
-                    state, scores, event = session.update(now, last_metrics)
+                if last_frame is not None:
+                    metrics = detector.process(last_frame)
+                    state, scores, event = session.update(now, metrics)
                     line = (
                         f"\rState: {state.name:<18} "
                         f"Drowsiness: {scores.drowsiness_score:6.2f} "
@@ -207,6 +254,8 @@ def _console_session_demo() -> None:
     print(f"Drowsy:      {stats.drowsy_seconds:.1f} s")
     print(f"Distracted:  {stats.distracted_seconds:.1f} s")
     print(f"Events:      {len(stats.events)}")
+    session_id = session.save_to_db()
+    print(f"Saved session with id {session_id}")
 
 
 if __name__ == "__main__":

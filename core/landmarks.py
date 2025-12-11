@@ -96,49 +96,48 @@ class LandmarkDetector:
 def _preview_loop() -> None:
     window_name = "WakeGuard Landmarks Preview"
     last_frame: Optional[Frame] = None
-    last_metrics: Optional[FaceMetrics] = None
     detector = LandmarkDetector()
 
     def on_frame(frame: Frame) -> None:
-        nonlocal last_frame, last_metrics
+        nonlocal last_frame
         last_frame = frame.copy()
-        last_metrics = detector.process(frame)
 
     with CameraCapture() as camera:
         camera.frame_callback = on_frame
 
-        while True:
-            if last_frame is not None:
-                frame_bgr = cv2.cvtColor(last_frame, cv2.COLOR_RGB2BGR)
-                text = "No face"
-                if last_metrics is not None and last_metrics.face_present:
-                    h, w, _ = frame_bgr.shape
-                    if last_metrics.landmarks is not None:
-                        pts = last_metrics.landmarks
-                        for idx in RIGHT_EYE_INDICES + LEFT_EYE_INDICES:
-                            x = int(pts[idx, 0] * w)
-                            y = int(pts[idx, 1] * h)
-                            cv2.circle(frame_bgr, (x, y), 1, (0, 255, 0), -1)
-                    le = last_metrics.left_eye_ear or 0.0
-                    re = last_metrics.right_eye_ear or 0.0
-                    text = f"L EAR: {le:.3f}  R EAR: {re:.3f}"
-                cv2.putText(
-                    frame_bgr,
-                    text,
-                    (20, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
-                cv2.imshow(window_name, frame_bgr)
-
-            if cv2.waitKey(1) & 0xFF == 27:
-                break
-
-        detector.close()
-        cv2.destroyAllWindows()
+        try:
+            while True:
+                if last_frame is not None:
+                    metrics = detector.process(last_frame)
+                    frame_bgr = cv2.cvtColor(last_frame, cv2.COLOR_RGB2BGR)
+                    text = "No face"
+                    if metrics.face_present:
+                        h, w, _ = frame_bgr.shape
+                        if metrics.landmarks is not None:
+                            pts = metrics.landmarks
+                            for idx in RIGHT_EYE_INDICES + LEFT_EYE_INDICES:
+                                x = int(pts[idx, 0] * w)
+                                y = int(pts[idx, 1] * h)
+                                cv2.circle(frame_bgr, (x, y), 1, (0, 255, 0), -1)
+                        le = metrics.left_eye_ear or 0.0
+                        re = metrics.right_eye_ear or 0.0
+                        text = f"L EAR: {le:.3f}  R EAR: {re:.3f}"
+                    cv2.putText(
+                        frame_bgr,
+                        text,
+                        (20, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 0),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    cv2.imshow(window_name, frame_bgr)
+                if cv2.waitKey(1) & 0xFF == 27:
+                    break
+        finally:
+            detector.close()
+            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
