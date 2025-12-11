@@ -30,15 +30,18 @@ from core.session import FocusSession, SessionConfig, SessionStats
 from core.signals import SignalConfig
 from core.state_machine import StateParams, FocusState
 from core.alarms import AlarmKind
+from data.settings import AppSettings, load_settings, save_settings
 from .calibration import CalibrationDialog, CalibrationResult
 from .history import HistoryDialog
 from .summary import SummaryDialog
+from .settings import SettingsDialog
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("WakeGuard")
+        self._settings: AppSettings = load_settings()
         self._camera: Optional[CameraCapture] = None
         self._detector: Optional[LandmarkDetector] = None
         self._session: Optional[FocusSession] = None
@@ -52,6 +55,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._init_sounds()
+        self._apply_settings_to_ui()
 
     def _build_ui(self) -> None:
         central = QWidget(self)
@@ -105,13 +109,16 @@ class MainWindow(QMainWindow):
         session_buttons_layout = QHBoxLayout()
         self.start_button = QPushButton("Start Session")
         self.history_button = QPushButton("Session history")
+        self.settings_button = QPushButton("Settings")
         session_buttons_layout.addWidget(self.start_button)
         session_buttons_layout.addWidget(self.history_button)
+        session_buttons_layout.addWidget(self.settings_button)
         layout.addLayout(session_buttons_layout)
 
         self.start_button.clicked.connect(self._on_start_stop_clicked)
         self.calibrate_button.clicked.connect(self._on_calibrate_clicked)
         self.history_button.clicked.connect(self._on_history_clicked)
+        self.settings_button.clicked.connect(self._on_settings_clicked)
 
         status_group = QVBoxLayout()
         self.state_label = QLabel("State: idle")
@@ -122,8 +129,8 @@ class MainWindow(QMainWindow):
         status_group.addWidget(self.distraction_label)
         layout.addLayout(status_group)
 
-        video_label_title = QLabel("Camera preview")
-        layout.addWidget(video_label_title)
+        self.video_title_label = QLabel("Camera preview")
+        layout.addWidget(self.video_title_label)
         self.video_label = QLabel()
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video_label.setFixedSize(320, 240)
@@ -131,7 +138,7 @@ class MainWindow(QMainWindow):
 
         central.setLayout(layout)
         self.setCentralWidget(central)
-        self.resize(560, 540)
+        self.resize(600, 560)
 
     def _init_sounds(self) -> None:
         base_dir = Path(__file__).resolve().parent.parent
@@ -143,15 +150,34 @@ class MainWindow(QMainWindow):
             sound = QSoundEffect(self)
             sound.setSource(QUrl.fromLocalFile(str(drowsy_path)))
             sound.setLoopCount(1)
-            sound.setVolume(1.0)
+            sound.setVolume(self._settings.alarm_volume)
             self._drowsy_sound = sound
 
         if distracted_path.exists():
             sound = QSoundEffect(self)
             sound.setSource(QUrl.fromLocalFile(str(distracted_path)))
             sound.setLoopCount(1)
-            sound.setVolume(1.0)
+            sound.setVolume(self._settings.alarm_volume)
             self._distracted_sound = sound
+
+    def _apply_settings_to_ui(self) -> None:
+        index = self.sensitivity_combo.findText(self._settings.sensitivity_profile)
+        if index >= 0:
+            self.sensitivity_combo.setCurrentIndex(index)
+        self._apply_preview_visibility()
+        self._apply_sound_settings()
+
+    def _apply_preview_visibility(self) -> None:
+        visible = self._settings.show_camera_preview
+        self.video_label.setVisible(visible)
+        self.video_title_label.setVisible(visible)
+
+    def _apply_sound_settings(self) -> None:
+        volume = self._settings.alarm_volume
+        if self._drowsy_sound is not None:
+            self._drowsy_sound.setVolume(volume)
+        if self._distracted_sound is not None:
+            self._distracted_sound.setVolume(volume)
 
     def _on_start_stop_clicked(self) -> None:
         if self._session is None:
@@ -185,6 +211,20 @@ class MainWindow(QMainWindow):
             return
         dlg = HistoryDialog(self)
         dlg.exec()
+
+    def _on_settings_clicked(self) -> None:
+        if self._session is not None:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Settings not available")
+            msg.setText("Please end the current session before opening settings.")
+            msg.exec()
+            return
+        dlg = SettingsDialog(self._settings, self)
+        result_code = dlg.exec()
+        if result_code == int(QDialog.DialogCode.Accepted) and dlg.result_settings is not None:
+            self._settings = dlg.result_settings
+            save_settings(self._settings)
+            self._apply_settings_to_ui()
 
     def _start_session(self) -> None:
         detect_drowsiness = self.detect_drowsiness_checkbox.isChecked()
@@ -229,6 +269,7 @@ class MainWindow(QMainWindow):
         self.sensitivity_combo.setEnabled(False)
         self.calibrate_button.setEnabled(False)
         self.history_button.setEnabled(False)
+        self.settings_button.setEnabled(False)
         self.state_label.setText("State: running...")
         self.state_label.setStyleSheet("")
         self.drowsiness_label.setText("Drowsiness: 0")
@@ -266,6 +307,7 @@ class MainWindow(QMainWindow):
         self.sensitivity_combo.setEnabled(True)
         self.calibrate_button.setEnabled(True)
         self.history_button.setEnabled(True)
+        self.settings_button.setEnabled(True)
         self.state_label.setText("State: idle")
         self.state_label.setStyleSheet("")
         self.drowsiness_label.setText("Drowsiness: 0")
@@ -295,7 +337,9 @@ class MainWindow(QMainWindow):
             self._last_score_label_update_mono = now
             self._update_score_labels(scores)
 
-        self._update_video_preview(self._last_frame)
+        if self._settings.show_camera_preview:
+            self._update_video_preview(self._last_frame)
+
         self._update_alarm_for_state(state)
 
         config = self._session.config
@@ -362,15 +406,25 @@ class MainWindow(QMainWindow):
             self._play_alarm(self._active_alarm_kind)
 
     def _play_alarm(self, kind: AlarmKind) -> None:
-        if kind == AlarmKind.DROWSY and self._drowsy_sound is not None:
-            if not self._drowsy_sound.isPlaying():
-                self._drowsy_sound.setLoopCount(1)
-                self._drowsy_sound.play()
+        if kind == AlarmKind.DROWSY:
+            if not self._settings.drowsy_alarm_enabled:
+                return
+            if self._drowsy_sound is not None:
+                if not self._drowsy_sound.isPlaying():
+                    self._drowsy_sound.setLoopCount(1)
+                    self._drowsy_sound.play()
+                return
+            QApplication.beep()
             return
-        if kind == AlarmKind.DISTRACTED and self._distracted_sound is not None:
-            if not self._distracted_sound.isPlaying():
-                self._distracted_sound.setLoopCount(1)
-                self._distracted_sound.play()
+        if kind == AlarmKind.DISTRACTED:
+            if not self._settings.distracted_alarm_enabled:
+                return
+            if self._distracted_sound is not None:
+                if not self._distracted_sound.isPlaying():
+                    self._distracted_sound.setLoopCount(1)
+                    self._distracted_sound.play()
+                return
+            QApplication.beep()
             return
         QApplication.beep()
 

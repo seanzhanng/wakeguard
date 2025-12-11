@@ -1,0 +1,7 @@
+{
+  "sensitivity_profile": "Balanced",
+  "alarm_volume": 1.0,
+  "drowsy_alarm_enabled": true,
+  "distracted_alarm_enabled": true,
+  "show_camera_preview": true
+}
