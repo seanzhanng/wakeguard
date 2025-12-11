@@ -1,2 +1,2 @@
 # wakeguard
-a focus tool for students and drivers using cv
+a cv focus tool that tracks drowsiness and distraction
