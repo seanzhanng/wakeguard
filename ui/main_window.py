@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import sys
 import time
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtCore import QTimer, Qt, QUrl
 from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtMultimedia import QSoundEffect
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -27,9 +29,10 @@ from core.landmarks import LandmarkDetector
 from core.session import FocusSession, SessionConfig, SessionStats
 from core.signals import SignalConfig
 from core.state_machine import StateParams, FocusState
-from core.alarms import AlarmController, AlarmKind
+from core.alarms import AlarmKind
 from .calibration import CalibrationDialog, CalibrationResult
 from .history import HistoryDialog
+from .summary import SummaryDialog
 
 
 class MainWindow(QMainWindow):
@@ -42,9 +45,13 @@ class MainWindow(QMainWindow):
         self._update_timer: Optional[QTimer] = None
         self._last_frame: Optional[np.ndarray] = None
         self._calibrated_eye_threshold: Optional[float] = None
-        self._alarm_controller: Optional[AlarmController] = None
+        self._drowsy_sound: Optional[QSoundEffect] = None
+        self._distracted_sound: Optional[QSoundEffect] = None
+        self._active_alarm_kind: Optional[AlarmKind] = None
+        self._last_score_label_update_mono: float = 0.0
 
         self._build_ui()
+        self._init_sounds()
 
     def _build_ui(self) -> None:
         central = QWidget(self)
@@ -108,8 +115,8 @@ class MainWindow(QMainWindow):
 
         status_group = QVBoxLayout()
         self.state_label = QLabel("State: idle")
-        self.drowsiness_label = QLabel("Drowsiness: 0.00")
-        self.distraction_label = QLabel("Distraction: 0.00")
+        self.drowsiness_label = QLabel("Drowsiness: 0")
+        self.distraction_label = QLabel("Distraction: 0")
         status_group.addWidget(self.state_label)
         status_group.addWidget(self.drowsiness_label)
         status_group.addWidget(self.distraction_label)
@@ -125,6 +132,26 @@ class MainWindow(QMainWindow):
         central.setLayout(layout)
         self.setCentralWidget(central)
         self.resize(560, 540)
+
+    def _init_sounds(self) -> None:
+        base_dir = Path(__file__).resolve().parent.parent
+        assets_dir = base_dir / "assets"
+        drowsy_path = assets_dir / "drowsy_alarm.wav"
+        distracted_path = assets_dir / "distracted_alarm.wav"
+
+        if drowsy_path.exists():
+            sound = QSoundEffect(self)
+            sound.setSource(QUrl.fromLocalFile(str(drowsy_path)))
+            sound.setLoopCount(1)
+            sound.setVolume(1.0)
+            self._drowsy_sound = sound
+
+        if distracted_path.exists():
+            sound = QSoundEffect(self)
+            sound.setSource(QUrl.fromLocalFile(str(distracted_path)))
+            sound.setLoopCount(1)
+            sound.setVolume(1.0)
+            self._distracted_sound = sound
 
     def _on_start_stop_clicked(self) -> None:
         if self._session is None:
@@ -187,7 +214,9 @@ class MainWindow(QMainWindow):
         self._camera.frame_callback = self._on_camera_frame
         self._camera.start()
 
-        self._alarm_controller = AlarmController()
+        self._active_alarm_kind = None
+        self._stop_all_alarms()
+        self._last_score_label_update_mono = 0.0
 
         self._update_timer = QTimer(self)
         self._update_timer.timeout.connect(self._on_update_timer)
@@ -202,8 +231,8 @@ class MainWindow(QMainWindow):
         self.history_button.setEnabled(False)
         self.state_label.setText("State: running...")
         self.state_label.setStyleSheet("")
-        self.drowsiness_label.setText("Drowsiness: 0.00")
-        self.distraction_label.setText("Distraction: 0.00")
+        self.drowsiness_label.setText("Drowsiness: 0")
+        self.distraction_label.setText("Distraction: 0")
 
     def _stop_session(self, manual: bool) -> None:
         if self._update_timer is not None:
@@ -226,7 +255,8 @@ class MainWindow(QMainWindow):
 
         self._session = None
         self._last_frame = None
-        self._alarm_controller = None
+        self._active_alarm_kind = None
+        self._stop_all_alarms()
         self.video_label.clear()
 
         self.start_button.setText("Start Session")
@@ -238,8 +268,8 @@ class MainWindow(QMainWindow):
         self.history_button.setEnabled(True)
         self.state_label.setText("State: idle")
         self.state_label.setStyleSheet("")
-        self.drowsiness_label.setText("Drowsiness: 0.00")
-        self.distraction_label.setText("Distraction: 0.00")
+        self.drowsiness_label.setText("Drowsiness: 0")
+        self.distraction_label.setText("Distraction: 0")
 
         if session is not None:
             stats = session.summary()
@@ -260,15 +290,13 @@ class MainWindow(QMainWindow):
         state, scores, event = self._session.update(now, metrics)
 
         self._update_state_label(state)
-        self.drowsiness_label.setText(f"Drowsiness: {scores.drowsiness_score:5.2f}")
-        self.distraction_label.setText(f"Distraction: {scores.distraction_score:5.2f}")
+
+        if self._last_score_label_update_mono == 0.0 or now - self._last_score_label_update_mono >= 1.0:
+            self._last_score_label_update_mono = now
+            self._update_score_labels(scores)
 
         self._update_video_preview(self._last_frame)
-
-        if event is not None and self._alarm_controller is not None:
-            alarm_kind = self._alarm_controller.process_event(event)
-            if alarm_kind is not None:
-                QApplication.beep()
+        self._update_alarm_for_state(state)
 
         config = self._session.config
         if (
@@ -289,6 +317,12 @@ class MainWindow(QMainWindow):
         else:
             self.state_label.setStyleSheet("")
 
+    def _update_score_labels(self, scores) -> None:
+        d = int(round(scores.drowsiness_score))
+        c = int(round(scores.distraction_score))
+        self.drowsiness_label.setText(f"Drowsiness: {d}")
+        self.distraction_label.setText(f"Distraction: {c}")
+
     def _update_video_preview(self, frame: np.ndarray) -> None:
         h, w, ch = frame.shape
         bytes_per_line = ch * w
@@ -304,6 +338,48 @@ class MainWindow(QMainWindow):
         )
         self.video_label.setPixmap(pixmap)
 
+    def _update_alarm_for_state(self, state: FocusState) -> None:
+        if state == FocusState.FOCUSED:
+            if self._active_alarm_kind is not None:
+                self._stop_all_alarms()
+                self._active_alarm_kind = None
+            return
+
+        desired_kind: Optional[AlarmKind] = None
+        if state == FocusState.DROWSY_ALARM:
+            desired_kind = AlarmKind.DROWSY
+        elif state == FocusState.DISTRACTED_ALARM:
+            desired_kind = AlarmKind.DISTRACTED
+
+        if desired_kind is None:
+            return
+
+        if self._active_alarm_kind != desired_kind:
+            self._stop_all_alarms()
+            self._active_alarm_kind = desired_kind
+
+        if self._active_alarm_kind is not None:
+            self._play_alarm(self._active_alarm_kind)
+
+    def _play_alarm(self, kind: AlarmKind) -> None:
+        if kind == AlarmKind.DROWSY and self._drowsy_sound is not None:
+            if not self._drowsy_sound.isPlaying():
+                self._drowsy_sound.setLoopCount(1)
+                self._drowsy_sound.play()
+            return
+        if kind == AlarmKind.DISTRACTED and self._distracted_sound is not None:
+            if not self._distracted_sound.isPlaying():
+                self._distracted_sound.setLoopCount(1)
+                self._distracted_sound.play()
+            return
+        QApplication.beep()
+
+    def _stop_all_alarms(self) -> None:
+        if self._drowsy_sound is not None:
+            self._drowsy_sound.stop()
+        if self._distracted_sound is not None:
+            self._distracted_sound.stop()
+
     def _params_for_sensitivity(self) -> tuple[StateParams, SignalConfig]:
         profile = self.sensitivity_combo.currentText()
         if profile == "Chill":
@@ -316,9 +392,9 @@ class MainWindow(QMainWindow):
                 min_drowsy_alarm_duration=3.0,
                 min_distracted_warning_duration=4.0,
                 min_distracted_alarm_duration=3.0,
-                drowsy_recovery_threshold=30.0,
-                distracted_recovery_threshold=30.0,
-                recovery_grace_duration=4.0,
+                drowsy_recovery_threshold=70.0,
+                distracted_recovery_threshold=70.0,
+                recovery_grace_duration=0.0,
             )
             signal_config = SignalConfig(
                 window_duration_seconds=25.0,
@@ -340,9 +416,9 @@ class MainWindow(QMainWindow):
                 min_drowsy_alarm_duration=1.0,
                 min_distracted_warning_duration=2.0,
                 min_distracted_alarm_duration=1.0,
-                drowsy_recovery_threshold=45.0,
-                distracted_recovery_threshold=45.0,
-                recovery_grace_duration=2.0,
+                drowsy_recovery_threshold=50.0,
+                distracted_recovery_threshold=50.0,
+                recovery_grace_duration=0.0,
             )
             signal_config = SignalConfig(
                 window_duration_seconds=15.0,
@@ -355,8 +431,29 @@ class MainWindow(QMainWindow):
                 distraction_face_missing_weight=120.0,
             )
         else:
-            state_params = StateParams()
-            signal_config = SignalConfig()
+            state_params = StateParams(
+                drowsy_warning_threshold=60.0,
+                drowsy_alarm_threshold=80.0,
+                distracted_warning_threshold=60.0,
+                distracted_alarm_threshold=80.0,
+                min_drowsy_warning_duration=2.0,
+                min_drowsy_alarm_duration=1.5,
+                min_distracted_warning_duration=2.0,
+                min_distracted_alarm_duration=1.5,
+                drowsy_recovery_threshold=60.0,
+                distracted_recovery_threshold=60.0,
+                recovery_grace_duration=0.0,
+            )
+            signal_config = SignalConfig(
+                window_duration_seconds=10.0,
+                eye_aspect_ratio_threshold=0.22,
+                minimum_blink_duration_seconds=0.10,
+                minimum_long_blink_duration_seconds=0.40,
+                baseline_blink_rate_per_minute=20.0,
+                drowsiness_long_blink_weight=35.0,
+                drowsiness_blink_rate_weight=1.5,
+                distraction_face_missing_weight=100.0,
+            )
 
         if self._calibrated_eye_threshold is not None:
             signal_config.eye_aspect_ratio_threshold = self._calibrated_eye_threshold
@@ -369,20 +466,8 @@ class MainWindow(QMainWindow):
         session_id: int,
         manual: bool,
     ) -> None:
-        reason = "Ended manually" if manual else "Completed target duration"
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Session summary")
-        text = (
-            f"{reason}\n\n"
-            f"Session id: {session_id}\n"
-            f"Duration: {stats.duration_seconds:.1f} s\n"
-            f"Focused: {stats.focused_seconds:.1f} s\n"
-            f"Drowsy: {stats.drowsy_seconds:.1f} s\n"
-            f"Distracted: {stats.distracted_seconds:.1f} s\n"
-            f"Events: {len(stats.events)}"
-        )
-        msg.setText(text)
-        msg.exec()
+        dlg = SummaryDialog(stats, session_id, manual, self)
+        dlg.exec()
 
     def closeEvent(self, event) -> None:
         if self._update_timer is not None:
@@ -396,7 +481,8 @@ class MainWindow(QMainWindow):
         self._camera = None
         self._detector = None
         self._last_frame = None
-        self._alarm_controller = None
+        self._active_alarm_kind = None
+        self._stop_all_alarms()
         super().closeEvent(event)
 
 
